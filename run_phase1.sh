@@ -29,6 +29,19 @@ JAVA_CSV="results_phase1_java.csv"
 VERSIONS_SMALL=(1 2)   # V1 e V2 para tamanhos pequenos (ambas linguagens)
 VERSIONS_LARGE=(2)     # só V2 para tamanhos grandes em C++ (V1 seria impraticável)
 
+PERF_EVENTS="L1-dcache-load-misses,cache-misses"
+PERF_TMP=$(mktemp /tmp/perf_out.XXXXXX)
+
+# Verificar se perf está disponível
+PERF_OK=false
+if command -v perf &>/dev/null; then
+    PERF_OK=true
+    echo "  [perf] disponível — a medir cache misses com: perf stat -e ${PERF_EVENTS}"
+else
+    echo "  [perf] não encontrado — colunas de cache misses ficarão vazias."
+    echo "         Instalar: sudo apt install linux-tools-common linux-tools-generic"
+fi
+
 # ── 1. Compilar ───────────────────────────────────────────────────────────────
 echo "╔══════════════════════════════════════════════╗"
 echo "║        Fase 1 — Compilação                  ║"
@@ -57,21 +70,43 @@ SIZES_LARGE=()
 for n in $(seq 4096 2048 10240); do SIZES_LARGE+=("$n"); done
 
 # ── 3. Inicializar CSV ────────────────────────────────────────────────────────
-HEADER="version,size_n,time_s,gflops"
+HEADER="version,size_n,time_s,gflops,l1_dcache_load_misses,cache_misses"
 echo "$HEADER" > "$CPP_CSV"
 echo "$HEADER" > "$JAVA_CSV"
 
 # ── 4. Funções auxiliares ─────────────────────────────────────────────────────
 
+# Extrai um contador de cache do output do perf stat (lida com separadores de milhar)
+parse_perf() {
+    local output="$1" event="$2"
+    echo "$output" | grep "${event}" | head -1 \
+        | awk '{gsub(/[,.]/, "", $1); print ($1+0 > 0) ? $1+0 : 0}'
+}
+
 # Executa o binário C++ e guarda o resultado no CSV
 run_cpp() {
     local ver="$1" n="$2"
     printf "  [C++  V%d  n=%6d]  " "$ver" "$n"
-    local line
-    line=$("./$CPP_BIN" "$ver" "$n" 2>/dev/null)
-    echo "$line" >> "$CPP_CSV"
+    local line l1_miss llc_miss extra
+    if [ "$PERF_OK" = true ]; then
+        # perf stat escreve para stderr; redirecionamos stderr→pipe e stdout→ficheiro temp
+        local perf_out
+        perf_out=$(perf stat -e "$PERF_EVENTS" "./$CPP_BIN" "$ver" "$n" 2>&1 >"$PERF_TMP")
+        line=$(cat "$PERF_TMP")
+        l1_miss=$(parse_perf "$perf_out" "L1-dcache-load-misses")
+        llc_miss=$(parse_perf "$perf_out" "cache-misses")
+        extra=",${l1_miss},${llc_miss}"
+    else
+        line=$("./$CPP_BIN" "$ver" "$n" 2>/dev/null)
+        extra=",,"
+    fi
+    echo "${line}${extra}" >> "$CPP_CSV"
     local gf; gf=$(echo "$line" | awk -F',' '{printf "%.4f", $4}')
-    echo "${gf} GFlop/s"
+    if [ "$PERF_OK" = true ]; then
+        echo "${gf} GFlop/s | L1-miss=${l1_miss} LLC-miss=${llc_miss}"
+    else
+        echo "${gf} GFlop/s"
+    fi
 }
 
 # Executa a JVM com warmup (n=256) antes da medição real
@@ -81,11 +116,25 @@ run_java() {
     printf "  [Java V%d  n=%6d]  " "$ver" "$n"
     # Warmup: corre uma vez com n=256 para activar o JIT compiler
     java -Xmx8g "$JAVA_CLASS" "$ver" 256 > /dev/null 2>&1 || true
-    local line
-    line=$(java -Xmx8g "$JAVA_CLASS" "$ver" "$n" 2>/dev/null)
-    echo "$line" >> "$JAVA_CSV"
+    local line l1_miss llc_miss extra
+    if [ "$PERF_OK" = true ]; then
+        local perf_out
+        perf_out=$(perf stat -e "$PERF_EVENTS" java -Xmx8g "$JAVA_CLASS" "$ver" "$n" 2>&1 >"$PERF_TMP")
+        line=$(cat "$PERF_TMP")
+        l1_miss=$(parse_perf "$perf_out" "L1-dcache-load-misses")
+        llc_miss=$(parse_perf "$perf_out" "cache-misses")
+        extra=",${l1_miss},${llc_miss}"
+    else
+        line=$(java -Xmx8g "$JAVA_CLASS" "$ver" "$n" 2>/dev/null)
+        extra=",,"
+    fi
+    echo "${line}${extra}" >> "$JAVA_CSV"
     local gf; gf=$(echo "$line" | awk -F',' '{printf "%.4f", $4}')
-    echo "${gf} GFlop/s"
+    if [ "$PERF_OK" = true ]; then
+        echo "${gf} GFlop/s | L1-miss=${l1_miss} LLC-miss=${llc_miss}"
+    else
+        echo "${gf} GFlop/s"
+    fi
 }
 
 # ── 5. C++ — tamanhos pequenos: V1 + V2 ──────────────────────────────────────
@@ -135,3 +184,6 @@ echo "╠═══════════════════════�
 printf "║  C++:  %-36s║\n" "$CPP_CSV"
 printf "║  Java: %-36s║\n" "$JAVA_CSV"
 echo "╚══════════════════════════════════════════════╝"
+
+# Limpeza
+rm -f "$PERF_TMP"
