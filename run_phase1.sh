@@ -7,10 +7,10 @@
 #           n = 1024, 1536, 2048, 2560, 3072          (step 512)
 #           n = 4096, 6144, 8192, 10240               (step 2048, só V2)
 #
-#  Java — V1 (naïve) e V2 (line):
+#  C#   — V1 (naïve) e V2 (line):
 #           n = 1024, 1536, 2048, 2560, 3072          (step 512)
 #
-#  Saída: results_phase1_cpp.csv  e  results_phase1_java.csv
+#  Saída: results_phase1_cpp.csv  e  results_phase1_cs.csv
 #
 #  NOTA: V1 para n ≥ 4096 pode demorar horas (stride-n → muitos cache misses).
 #        Para testar V1 em tamanhos grandes, altere VERSIONS_LARGE para (1 2).
@@ -21,10 +21,10 @@ set -euo pipefail
 # ── Configuração ──────────────────────────────────────────────────────────────
 CPP_SRC="mult.cpp"
 CPP_BIN="multC"
-JAVA_SRC="mult.java"
-JAVA_CLASS="MatMult"
+CS_PROJ="mult.csproj"
+CS_BIN="bin_cs/multCS.dll"
 CPP_CSV="results_phase1_cpp.csv"
-JAVA_CSV="results_phase1_java.csv"
+CS_CSV="results_phase1_cs.csv"
 
 VERSIONS_SMALL=(1 2)   # V1 e V2 para tamanhos pequenos (ambas linguagens)
 VERSIONS_LARGE=(2)     # só V2 para tamanhos grandes em C++ (V1 seria impraticável)
@@ -33,29 +33,47 @@ PERF_EVENTS=""
 L2_EVENT=""
 PERF_TMP=$(mktemp /tmp/perf_out.XXXXXX)
 
-# Verificar se perf está disponível e detetar evento L2 (específico por CPU)
+# ── Verificar perf e detetar evento L2 ───────────────────────────────────────
 PERF_OK=false
 if command -v perf &>/dev/null; then
     PERF_OK=true
+
     # Auto-detetar evento L2 miss conforme o fabricante da CPU
     if grep -q "GenuineIntel" /proc/cpuinfo 2>/dev/null; then
         L2_EVENT="l2_rqsts.miss"
     elif grep -q "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
         L2_EVENT="l2_cache_misses"
     fi
+
     if [ -n "$L2_EVENT" ]; then
         PERF_EVENTS="L1-dcache-load-misses,${L2_EVENT},LLC-load-misses"
     else
         PERF_EVENTS="L1-dcache-load-misses,LLC-load-misses"
         echo "  [perf] Aviso: CPU não reconhecida — L2 misses não serão medidos."
     fi
-    # Avisar se o kernel bloqueia contadores hardware (paranoid > 1 → valores 0)
+
+    # ── Validar se contadores hardware estão realmente acessíveis ─────────────
+    # Causa mais comum de L1=0: perf_event_paranoid > 1 bloqueia hardware PMU
     paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "?")
     if [[ "$paranoid" =~ ^[0-9]+$ ]] && [ "$paranoid" -gt 1 ]; then
-        echo "  [perf] AVISO: perf_event_paranoid=${paranoid} — contadores hw bloqueados (valores serão 0)."
+        echo "  [perf] AVISO: perf_event_paranoid=${paranoid} — contadores hw BLOQUEADOS (L1/L2/LLC serão 0)."
         echo "         Corrigir: sudo sysctl kernel.perf_event_paranoid=1"
     fi
-    echo "  [perf] disponível — eventos: ${PERF_EVENTS}"
+
+    # Detetar WSL (não suporta hardware PMU por defeito)
+    if grep -qiE "microsoft|wsl" /proc/version 2>/dev/null; then
+        echo "  [perf] AVISO: WSL detectado — hardware PMU não suportado."
+        echo "         Execute em Linux nativo para cache misses reais."
+    fi
+
+    # Teste rápido: validar que L1-dcache-load-misses funciona
+    _test=$(perf stat -e L1-dcache-load-misses true 2>&1) || true
+    if echo "$_test" | grep -qE "<not supported>|not counted|Operation not permitted|sys_perf_event_open|No such event"; then
+        echo "  [perf] ERRO: L1-dcache-load-misses indisponível — verifique as permissões acima."
+        PERF_OK=false
+    else
+        echo "  [perf] Hardware PMU OK — eventos: ${PERF_EVENTS}"
+    fi
 else
     echo "  [perf] não encontrado — colunas de cache misses ficarão vazias."
     echo "         Instalar: sudo apt install linux-tools-common linux-tools-generic"
@@ -70,15 +88,15 @@ echo -n "  [C++]  g++ -O2 ... "
 g++ -O2 -o "$CPP_BIN" "$CPP_SRC"
 echo "OK  →  ./$CPP_BIN"
 
-JAVA_OK=false
-if command -v javac &> /dev/null; then
-    echo -n "  [Java] javac    ... "
-    javac "$JAVA_SRC"
-    echo "OK  →  ${JAVA_CLASS}.class"
-    JAVA_OK=true
+CS_OK=false
+if command -v dotnet &>/dev/null; then
+    echo -n "  [C#]   dotnet build -c Release ... "
+    dotnet build -c Release "$CS_PROJ" -o bin_cs > /dev/null 2>&1
+    echo "OK  →  ${CS_BIN}"
+    CS_OK=true
 else
-    echo "  [Java] javac não encontrado — a ignorar benchmarks Java."
-    echo "         Instalar: sudo apt install default-jdk"
+    echo "  [C#]   dotnet não encontrado — a ignorar benchmarks C#."
+    echo "         Instalar: https://dotnet.microsoft.com/download"
 fi
 
 # ── 2. Ranges de tamanhos ─────────────────────────────────────────────────────
@@ -91,15 +109,15 @@ for n in $(seq 4096 2048 10240); do SIZES_LARGE+=("$n"); done
 # ── 3. Inicializar CSV ────────────────────────────────────────────────────────
 HEADER="version,size_n,time_s,gflops,l1_dcache_load_misses,l2_cache_misses,llc_load_misses"
 echo "$HEADER" > "$CPP_CSV"
-echo "$HEADER" > "$JAVA_CSV"
+echo "$HEADER" > "$CS_CSV"
 
 # ── 4. Funções auxiliares ─────────────────────────────────────────────────────
 
 # Extrai um contador de cache do output do perf stat (lida com separadores de milhar)
 parse_perf() {
     local output="$1" event="$2"
-    echo "$output" | grep "${event}" | head -1 \
-        | awk '{gsub(/[,.]/, "", $1); print ($1+0 > 0) ? $1+0 : 0}'
+    echo "$output" | grep -F "${event}" | head -1 \
+        | awk '{gsub(/[,.]/, "", $1); val=$1+0; print (val>0)?val:0}'
 }
 
 # Executa o binário C++ e guarda o resultado no CSV
@@ -108,7 +126,6 @@ run_cpp() {
     printf "  [C++  V%d  n=%6d]  " "$ver" "$n"
     local line l1_miss l2_miss llc_miss extra
     if [ "$PERF_OK" = true ]; then
-        # perf stat escreve para stderr; redirecionamos stderr→pipe e stdout→ficheiro temp
         local perf_out
         perf_out=$(perf stat -e "$PERF_EVENTS" "./$CPP_BIN" "$ver" "$n" 2>&1 >"$PERF_TMP") || true
         line=$(cat "$PERF_TMP")
@@ -133,17 +150,17 @@ run_cpp() {
     fi
 }
 
-# Executa a JVM com warmup (n=256) antes da medição real
-# O warmup força a compilação JIT das funções antes do teste a dimensão real
-run_java() {
+# Executa o binário C# com warmup (n=256) antes da medição real
+# O warmup força a compilação JIT antes do teste à dimensão real
+run_cs() {
     local ver="$1" n="$2"
-    printf "  [Java V%d  n=%6d]  " "$ver" "$n"
+    printf "  [C#   V%d  n=%6d]  " "$ver" "$n"
     # Warmup: corre uma vez com n=256 para activar o JIT compiler
-    java -Xmx8g "$JAVA_CLASS" "$ver" 256 > /dev/null 2>&1 || true
+    dotnet "$CS_BIN" "$ver" 256 > /dev/null 2>&1 || true
     local line l1_miss l2_miss llc_miss extra
     if [ "$PERF_OK" = true ]; then
         local perf_out
-        perf_out=$(perf stat -e "$PERF_EVENTS" java -Xmx8g "$JAVA_CLASS" "$ver" "$n" 2>&1 >"$PERF_TMP") || true
+        perf_out=$(perf stat -e "$PERF_EVENTS" dotnet "$CS_BIN" "$ver" "$n" 2>&1 >"$PERF_TMP") || true
         line=$(cat "$PERF_TMP")
         l1_miss=$(parse_perf "$perf_out" "L1-dcache-load-misses")
         if [ -n "$L2_EVENT" ]; then
@@ -154,10 +171,10 @@ run_java() {
         llc_miss=$(parse_perf "$perf_out" "LLC-load-misses")
         extra=",${l1_miss},${l2_miss},${llc_miss}"
     else
-        line=$(java -Xmx8g "$JAVA_CLASS" "$ver" "$n" 2>/dev/null)
+        line=$(dotnet "$CS_BIN" "$ver" "$n" 2>/dev/null)
         extra=",,,,"
     fi
-    echo "${line}${extra}" >> "$JAVA_CSV"
+    echo "${line}${extra}" >> "$CS_CSV"
     local gf; gf=$(echo "$line" | awk -F',' '{printf "%.4f", $4}')
     if [ "$PERF_OK" = true ]; then
         echo "${gf} GFlop/s | L1-miss=${l1_miss} L2-miss=${l2_miss} LLC-miss=${llc_miss}"
@@ -188,21 +205,21 @@ for n in "${SIZES_LARGE[@]}"; do
     done
 done
 
-# ── 7. Java — tamanhos pequenos: V1 + V2 ─────────────────────────────────────
-if [ "$JAVA_OK" = true ]; then
+# ── 7. C# — tamanhos pequenos: V1 + V2 ───────────────────────────────────────
+if [ "$CS_OK" = true ]; then
     echo ""
     echo "╔══════════════════════════════════════════════╗"
-    echo "║  Java — Tamanhos pequenos (1024→3072,s=512) ║"
+    echo "║  C#  — Tamanhos pequenos (1024→3072,s=512)  ║"
     echo "╚══════════════════════════════════════════════╝"
     for n in "${SIZES_SMALL[@]}"; do
         for v in "${VERSIONS_SMALL[@]}"; do
-            run_java "$v" "$n"
+            run_cs "$v" "$n"
         done
     done
 else
     echo ""
-    echo "  [Java] Benchmarks ignorados (javac não disponível)."
-    echo "         Instalar com: sudo apt install default-jdk"
+    echo "  [C#] Benchmarks ignorados (dotnet não disponível)."
+    echo "       Instalar: https://dotnet.microsoft.com/download"
 fi
 
 # ── 8. Sumário ────────────────────────────────────────────────────────────────
@@ -210,8 +227,8 @@ echo ""
 echo "╔══════════════════════════════════════════════╗"
 echo "║  Fase 1 concluída!                          ║"
 echo "╠══════════════════════════════════════════════╣"
-printf "║  C++:  %-36s║\n" "$CPP_CSV"
-printf "║  Java: %-36s║\n" "$JAVA_CSV"
+printf "║  C++: %-37s║\n" "$CPP_CSV"
+printf "║  C#:  %-37s║\n" "$CS_CSV"
 echo "╚══════════════════════════════════════════════╝"
 
 # Limpeza
